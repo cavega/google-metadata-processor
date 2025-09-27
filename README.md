@@ -164,6 +164,9 @@ python3 test_takeout_processor.py
 python3 run_tests.py
 ```
 
+**Continuous Integration:**
+All pull requests automatically run the full test suite via GitHub Actions. PRs cannot be merged unless all tests pass.
+
 ## Technical Details
 
 - **Supported file types**: JPG, PNG, HEIC, MP4, MOV, GIF, TIFF, BMP
