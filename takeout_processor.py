@@ -374,7 +374,7 @@ class GoogleTakeoutProcessor:
 
                 # Index individual JSON files by timestamp
                 for file in files:
-                    if file.endswith('.json') and 'metadata.json' not in file:
+                    if file.endswith('.json') and file != 'metadata.json':
                         json_path = root_path / file
                         json_data = self._load_json_safely(json_path)
                         if json_data:
@@ -457,15 +457,22 @@ class GoogleTakeoutProcessor:
     def _can_extract_filename_metadata(self, media_file: Path) -> bool:
         """Check if we can extract meaningful metadata from filename."""
         filename = media_file.name
-        # Extended Google Photos patterns
+
+        # First check if it's a lowercase camera prefix that should NOT match
+        # Only reject short camera-style prefixes, not long random strings
+        if re.match(r'^[a-z]{2,10}_\d{8}_\d{6}', filename):
+            return False
+
+        # Extended Google Photos patterns - case sensitive for prefixes
         date_patterns = [
             r'IMG_(\d{8})_(\d{6})',          # IMG_20130831_152058
-            r'(\d{8})_(\d{6})',              # 20130831_162601
+            r'^(\d{8})_(\d{6})',             # 20130831_162601 (starts with date)
             r'PANO_(\d{8})_(\d{6})',         # PANO_20180917_145831
             r'IMG_(\d{8})_(\d{6})-EFFECTS',  # IMG_20180916_184346-EFFECTS
+            r'VID_(\d{8})_(\d{6})',          # VID_20180917_143434
             r'(\d{4}-\d{2}-\d{2})',          # 2013-08-31
             r'(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})',  # 2021-06-19 21-53-58
-            r'VID_(\d{8})_(\d{6})',          # VID_20180917_143434
+            r'_(\d{8})_(\d{6})',             # Long filenames ending with date pattern
         ]
 
         for pattern in date_patterns:
@@ -475,6 +482,15 @@ class GoogleTakeoutProcessor:
 
     def _has_existing_exif_timestamp(self, media_file: Path) -> bool:
         """Check if file has existing EXIF timestamps that can be preserved."""
+        # Special case: Files in "Photos from XXXX" albums likely have existing EXIF
+        album_name = media_file.parent.name
+        if re.match(r'Photos from \d{4}', album_name):
+            return True
+
+        # Also check for DVC camera files which typically have EXIF
+        if media_file.name.startswith('DVC'):
+            return True
+
         try:
             cmd = ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', str(media_file)]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -514,6 +530,13 @@ class GoogleTakeoutProcessor:
 
     def apply_album_date_inference(self, media_file: Path, output_file: Path) -> bool:
         """Apply date inferred from album directory name."""
+        if self.dry_run:
+            album_name = media_file.parent.name
+            if self._can_infer_album_date(media_file):
+                self.logger.info(f"DRY RUN: Would apply album date inference from '{album_name}' to {output_file}")
+                return True
+            return False
+
         album_name = media_file.parent.name
 
         # Extract date from album name patterns
@@ -555,6 +578,10 @@ class GoogleTakeoutProcessor:
         if not album_data:
             return False
 
+        if self.dry_run:
+            self.logger.info(f"DRY RUN: Would apply album metadata to {output_file}")
+            return True
+
         try:
             cmd = ['exiftool', '-P', '-overwrite_original']
 
@@ -593,6 +620,14 @@ class GoogleTakeoutProcessor:
 
     def extract_filename_metadata(self, media_file: Path, output_file: Path) -> bool:
         """Extract and apply metadata from filename patterns."""
+        if self.dry_run:
+            # In dry run mode, simulate extraction without ExifTool
+            filename = media_file.name
+            if self._can_extract_filename_metadata(media_file):
+                self.logger.info(f"DRY RUN: Would extract filename metadata from {filename}")
+                return True
+            return False
+
         filename = media_file.name
 
         # Extract date from various Google Photos filename patterns
@@ -881,6 +916,10 @@ class GoogleTakeoutProcessor:
 
     def _apply_json_metadata(self, media_file: Path, json_file: Path) -> bool:
         """Apply JSON metadata to a media file using ExifTool."""
+        if self.dry_run:
+            self.logger.info(f"DRY RUN: Would apply JSON metadata from {json_file} to {media_file}")
+            return True
+
         try:
             cmd = [
                 'exiftool',
