@@ -145,6 +145,25 @@ If you run into problems:
 3. **Use the GUI**: Try `--gui` for a visual interface
 4. **Check file permissions**: Make sure you can write to the output folder
 
+## Testing
+
+This tool includes a comprehensive test suite to ensure reliable metadata processing and prevent regressions.
+
+**Test Coverage:**
+- **Metadata Recovery Strategies**: Tests all 6 processing strategies that achieve 100% success rate
+- **File Pattern Recognition**: Validates handling of different Google Photos filename formats
+- **Edge Cases**: Tests Unicode album names, malformed data, and error conditions
+- **Integration**: End-to-end workflow verification
+
+**Running Tests:**
+```bash
+# Run all tests
+python3 test_takeout_processor.py
+
+# Run with detailed test runner
+python3 run_tests.py
+```
+
 ## Technical Details
 
 - **Supported file types**: JPG, PNG, HEIC, MP4, MOV, GIF, TIFF, BMP
