@@ -56,6 +56,11 @@ class GoogleTakeoutProcessor:
             'total_files': 0,
             'processed_files': 0,
             'json_matched': 0,
+            'cross_album_matched': 0,
+            'album_metadata_applied': 0,
+            'filename_metadata_extracted': 0,
+            'exif_preserved': 0,
+            'album_date_inferred': 0,
             'date_restored': 0,
             'gps_restored': 0,
             'extensions_fixed': 0,
@@ -63,6 +68,11 @@ class GoogleTakeoutProcessor:
             'zip_files_extracted': 0,
             'errors': []
         }
+
+        # Metadata caching for enhanced processing
+        self.json_metadata_cache = {}  # timestamp -> json_file_path
+        self.album_metadata_cache = {}  # album_path -> album_metadata
+        self.metadata_indexed = False
 
         self.setup_logging()
         self.validate_environment()
@@ -351,6 +361,281 @@ class GoogleTakeoutProcessor:
 
         return None
 
+    def index_metadata_for_enhanced_processing(self, google_photos_dirs: List[Path]):
+        """Index all JSON metadata and album data for cross-album matching."""
+        if self.metadata_indexed:
+            return
+
+        self.logger.info("Indexing metadata for enhanced processing...")
+
+        for google_photos_dir in google_photos_dirs:
+            for root, dirs, files in os.walk(google_photos_dir):
+                root_path = Path(root)
+
+                # Index individual JSON files by timestamp
+                for file in files:
+                    if file.endswith('.json') and 'metadata.json' not in file:
+                        json_path = root_path / file
+                        json_data = self._load_json_safely(json_path)
+                        if json_data:
+                            timestamp = json_data.get('photoTakenTime', {}).get('timestamp')
+                            if timestamp:
+                                self.json_metadata_cache[timestamp] = json_path
+
+                # Index album-level metadata
+                album_metadata_path = root_path / 'metadata.json'
+                if album_metadata_path.exists():
+                    album_data = self._load_json_safely(album_metadata_path)
+                    if album_data:
+                        self.album_metadata_cache[root_path] = album_data
+
+        self.metadata_indexed = True
+        self.logger.info(f"Indexed {len(self.json_metadata_cache)} JSON files and {len(self.album_metadata_cache)} albums")
+
+    def find_json_metadata_enhanced(self, media_file: Path) -> Tuple[Optional[Path], str]:
+        """Enhanced JSON metadata finding with multiple strategies.
+
+        Returns:
+            Tuple of (json_path, strategy_used)
+            strategy_used can be: 'direct', 'cross_album', 'album_level', 'filename', 'exif_preservation', 'album_date_inference', 'none'
+        """
+        # Strategy 1: Try direct matching (existing logic)
+        json_path = self.find_json_metadata(media_file)
+        if json_path:
+            return json_path, 'direct'
+
+        # Strategy 2: Cross-album timestamp matching
+        if self.metadata_indexed:
+            # Extract EXIF timestamp from media file
+            media_timestamp = self._extract_exif_timestamp(media_file)
+            if media_timestamp and media_timestamp in self.json_metadata_cache:
+                return self.json_metadata_cache[media_timestamp], 'cross_album'
+
+        # Strategy 3: Album-level metadata
+        album_path = media_file.parent
+        if album_path in self.album_metadata_cache:
+            return None, 'album_level'  # Signal to use album metadata
+
+        # Strategy 4: Filename-based date extraction
+        if self._can_extract_filename_metadata(media_file):
+            return None, 'filename'  # Signal to use filename metadata
+
+        # Strategy 5: EXIF timestamp preservation
+        if self._has_existing_exif_timestamp(media_file):
+            return None, 'exif_preservation'  # Signal to preserve existing EXIF
+
+        # Strategy 6: Album directory date inference
+        if self._can_infer_album_date(media_file):
+            return None, 'album_date_inference'  # Signal to use album date
+
+        return None, 'none'
+
+    def _extract_exif_timestamp(self, media_file: Path) -> Optional[str]:
+        """Extract timestamp from EXIF data to match with JSON metadata."""
+        try:
+            cmd = ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', str(media_file)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)[0]
+
+            # Try various timestamp fields
+            for field in ['DateTimeOriginal', 'CreateDate']:
+                date_str = metadata.get(field)
+                if date_str:
+                    # Convert to Unix timestamp format used in Google JSON
+                    from datetime import datetime
+                    try:
+                        dt = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                        return str(int(dt.timestamp()))
+                    except ValueError:
+                        continue
+
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+            pass
+
+        return None
+
+    def _can_extract_filename_metadata(self, media_file: Path) -> bool:
+        """Check if we can extract meaningful metadata from filename."""
+        filename = media_file.name
+        # Extended Google Photos patterns
+        date_patterns = [
+            r'IMG_(\d{8})_(\d{6})',          # IMG_20130831_152058
+            r'(\d{8})_(\d{6})',              # 20130831_162601
+            r'PANO_(\d{8})_(\d{6})',         # PANO_20180917_145831
+            r'IMG_(\d{8})_(\d{6})-EFFECTS',  # IMG_20180916_184346-EFFECTS
+            r'(\d{4}-\d{2}-\d{2})',          # 2013-08-31
+            r'(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})',  # 2021-06-19 21-53-58
+            r'VID_(\d{8})_(\d{6})',          # VID_20180917_143434
+        ]
+
+        for pattern in date_patterns:
+            if re.search(pattern, filename):
+                return True
+        return False
+
+    def _has_existing_exif_timestamp(self, media_file: Path) -> bool:
+        """Check if file has existing EXIF timestamps that can be preserved."""
+        try:
+            cmd = ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', str(media_file)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)[0]
+
+            # Check if any meaningful timestamp exists
+            return bool(metadata.get('DateTimeOriginal') or metadata.get('CreateDate'))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return False
+
+    def _can_infer_album_date(self, media_file: Path) -> bool:
+        """Check if we can infer date from album directory name."""
+        album_name = media_file.parent.name
+
+        # Common album naming patterns with years
+        date_patterns = [
+            r'Photos from (\d{4})',           # "Photos from 2003"
+            r'(\d{4}) ',                      # "2013 Xmas"
+            r'(\d{4})',                       # Any 4-digit year
+            r'([A-Za-z]+ \d{1,2}, \d{4})',   # "January 15, 2018"
+        ]
+
+        for pattern in date_patterns:
+            if re.search(pattern, album_name):
+                return True
+        return False
+
+    def preserve_exif_timestamp(self, media_file: Path, output_file: Path) -> bool:
+        """Preserve existing EXIF timestamps without modification."""
+        try:
+            # This strategy essentially does nothing - the file keeps its existing EXIF
+            # We just mark it as processed to avoid it going to unmapped
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to preserve EXIF for {output_file}: {e}")
+            return False
+
+    def apply_album_date_inference(self, media_file: Path, output_file: Path) -> bool:
+        """Apply date inferred from album directory name."""
+        album_name = media_file.parent.name
+
+        # Extract date from album name patterns
+        date_patterns = [
+            (r'Photos from (\d{4})', lambda m: f"{m.group(1)}:01:01 12:00:00"),  # Default to Jan 1
+            (r'(\d{4}) ', lambda m: f"{m.group(1)}:01:01 12:00:00"),             # Year at start
+            (r'(\d{4})', lambda m: f"{m.group(1)}:01:01 12:00:00"),              # Just year
+        ]
+
+        for pattern, date_formatter in date_patterns:
+            match = re.search(pattern, album_name)
+            if match:
+                try:
+                    date_str = date_formatter(match)
+
+                    cmd = [
+                        'exiftool', '-P', '-overwrite_original',
+                        f'-DateTimeOriginal={date_str}',
+                        f'-CreateDate={date_str}',
+                        f'-ImageDescription=From album: {album_name}',
+                        str(output_file)
+                    ]
+
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    return True
+
+                except subprocess.CalledProcessError as e:
+                    self.logger.warning(f"Failed to apply album date inference to {output_file}: {e}")
+                    continue
+
+        return False
+
+
+    def apply_album_metadata(self, media_file: Path, output_file: Path) -> bool:
+        """Apply album-level metadata to a file."""
+        album_path = media_file.parent
+        album_data = self.album_metadata_cache.get(album_path)
+
+        if not album_data:
+            return False
+
+        try:
+            cmd = ['exiftool', '-P', '-overwrite_original']
+
+            # Apply album title as description
+            if album_data.get('title'):
+                cmd.extend([f'-ImageDescription={album_data["title"]}'])
+
+            # Apply album date if available
+            if album_data.get('date', {}).get('timestamp'):
+                timestamp = int(album_data['date']['timestamp'])
+                from datetime import datetime
+                date_str = datetime.fromtimestamp(timestamp).strftime('%Y:%m:%d %H:%M:%S')
+                cmd.extend([f'-DateTimeOriginal={date_str}', f'-CreateDate={date_str}'])
+
+            # Apply album location if available
+            enrichments = album_data.get('enrichments', [])
+            for enrichment in enrichments:
+                location_data = enrichment.get('locationEnrichment', {}).get('location', [])
+                if location_data:
+                    location = location_data[0]
+                    if 'latitudeE7' in location and 'longitudeE7' in location:
+                        lat = location['latitudeE7'] / 1e7
+                        lon = location['longitudeE7'] / 1e7
+                        cmd.extend([f'-GPSLatitude={lat}', f'-GPSLongitude={lon}'])
+                    break
+
+            cmd.append(str(output_file))
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            self.stats['album_metadata_applied'] += 1
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Failed to apply album metadata to {output_file}: {e}")
+            return False
+
+    def extract_filename_metadata(self, media_file: Path, output_file: Path) -> bool:
+        """Extract and apply metadata from filename patterns."""
+        filename = media_file.name
+
+        # Extract date from various Google Photos filename patterns
+        date_patterns = [
+            (r'IMG_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', '%Y:%m:%d %H:%M:%S'),
+            (r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', '%Y:%m:%d %H:%M:%S'),
+            (r'PANO_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', '%Y:%m:%d %H:%M:%S'),
+            (r'IMG_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})-EFFECTS', '%Y:%m:%d %H:%M:%S'),
+            (r'VID_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})', '%Y:%m:%d %H:%M:%S'),
+            (r'(\d{4})-(\d{2})-(\d{2})', '%Y:%m:%d 12:00:00'),  # Default time for date-only
+            (r'(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})', '%Y:%m:%d %H:%M:%S'),  # 2021-06-19 21-53-58
+        ]
+
+        for pattern, format_str in date_patterns:
+            match = re.search(pattern, filename)
+            if match:
+                try:
+                    if len(match.groups()) == 6:  # Full datetime
+                        year, month, day, hour, minute, second = match.groups()
+                        date_str = f"{year}:{month}:{day} {hour}:{minute}:{second}"
+                    elif len(match.groups()) == 3:  # Date only
+                        year, month, day = match.groups()
+                        date_str = f"{year}:{month}:{day} 12:00:00"
+                    else:
+                        continue
+
+                    cmd = [
+                        'exiftool', '-P', '-overwrite_original',
+                        f'-DateTimeOriginal={date_str}',
+                        f'-CreateDate={date_str}',
+                        str(output_file)
+                    ]
+
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    self.stats['filename_metadata_extracted'] += 1
+                    return True
+
+                except subprocess.CalledProcessError as e:
+                    self.logger.warning(f"Failed to apply filename metadata to {output_file}: {e}")
+                    continue
+
+        return False
+
     def detect_file_type_mismatch(self, file_path: Path) -> Optional[str]:
         """Detect files with incorrect extensions using ExifTool."""
         try:
@@ -447,25 +732,53 @@ class GoogleTakeoutProcessor:
 
             if self.dry_run:
                 self.logger.info(f"DRY RUN: Would process batch of {len(batch)} files")
-                success_count += len(batch)
-                # Simulate metadata tracking for dry run
+                # Simulate enhanced metadata tracking for dry run
+                strategies_used = {}
                 for file_path in batch:
-                    json_file = self.find_json_metadata(file_path)
-                    if json_file:
-                        self.stats['json_matched'] += 1
+                    json_file, strategy = self.find_json_metadata_enhanced(file_path)
+                    strategies_used[strategy] = strategies_used.get(strategy, 0) + 1
+
+                    if strategy != 'none':
+                        success_count += 1
                         successfully_processed_files.append(file_path)
-                        # Simulate checking for metadata
-                        json_data = self._load_json_safely(json_file)
-                        if json_data.get('photoTakenTime', {}).get('timestamp'):
-                            self.stats['date_restored'] += 1
-                        if json_data.get('geoData', {}).get('latitude', 0) != 0:
-                            self.stats['gps_restored'] += 1
+
+                        # Update strategy-specific stats
+                        if strategy == 'direct':
+                            self.stats['json_matched'] += 1
+                        elif strategy == 'cross_album':
+                            self.stats['cross_album_matched'] += 1
+                        elif strategy == 'album_level':
+                            self.stats['album_metadata_applied'] += 1
+                        elif strategy == 'filename':
+                            self.stats['filename_metadata_extracted'] += 1
+                        elif strategy == 'exif_preservation':
+                            self.stats['exif_preserved'] += 1
+                        elif strategy == 'album_date_inference':
+                            self.stats['album_date_inferred'] += 1
+
+                        # Simulate metadata availability
+                        if strategy in ['direct', 'cross_album'] and json_file:
+                            json_data = self._load_json_safely(json_file)
+                            if json_data.get('photoTakenTime', {}).get('timestamp'):
+                                self.stats['date_restored'] += 1
+                            if json_data.get('geoData', {}).get('latitude', 0) != 0:
+                                self.stats['gps_restored'] += 1
+                        elif strategy in ['album_level', 'filename', 'album_date_inference']:
+                            self.stats['date_restored'] += 1  # These strategies set dates
+                        elif strategy == 'exif_preservation':
+                            # May or may not have dates, don't assume
+                            pass
                     else:
                         unmapped_files.append(file_path)
+
+                # Log strategy usage for dry run
+                if strategies_used:
+                    strategy_summary = ", ".join([f"{strategy}: {count}" for strategy, count in strategies_used.items()])
+                    self.logger.info(f"DRY RUN Batch {batch_num + 1} strategy usage - {strategy_summary}")
                 continue
 
-            # Process batch with ExifTool and collect unmapped files
-            batch_success, batch_unmapped, batch_processed = self._process_batch_with_verification(batch, batch_num + 1)
+            # Process batch with Enhanced ExifTool and collect unmapped files
+            batch_success, batch_unmapped, batch_processed = self._process_batch_with_enhanced_metadata(batch, batch_num + 1)
             success_count += batch_success
             unmapped_files.extend(batch_unmapped)
             successfully_processed_files.extend(batch_processed)
@@ -490,6 +803,138 @@ class GoogleTakeoutProcessor:
             self.logger.warning(f"Failed to load JSON {json_path}: {e}")
             return {}
 
+    def _process_batch_with_enhanced_metadata(self, batch: List[Path], batch_num: int) -> Tuple[int, List[Path], List[Path]]:
+        """Process a batch of files using enhanced multi-strategy metadata approach."""
+        batch_success = 0
+        batch_unmapped = []
+        batch_processed = []
+
+        for file_path in batch:
+            try:
+                # Use enhanced metadata finding
+                json_path, strategy = self.find_json_metadata_enhanced(file_path)
+
+                # Apply metadata based on strategy
+                success = False
+
+                if strategy == 'direct' and json_path:
+                    # Use existing JSON metadata processing
+                    success = self._apply_json_metadata(file_path, json_path)
+                    if success:
+                        self.stats['json_matched'] += 1
+
+                elif strategy == 'cross_album' and json_path:
+                    # Apply JSON metadata from different album
+                    success = self._apply_json_metadata(file_path, json_path)
+                    if success:
+                        self.stats['cross_album_matched'] += 1
+
+                elif strategy == 'album_level':
+                    # Apply album-level metadata
+                    success = self.apply_album_metadata(file_path, file_path)
+                    if success:
+                        self.stats['album_metadata_applied'] += 1
+
+                elif strategy == 'filename':
+                    # Extract metadata from filename
+                    success = self.extract_filename_metadata(file_path, file_path)
+                    if success:
+                        self.stats['filename_metadata_extracted'] += 1
+
+                elif strategy == 'exif_preservation':
+                    # Preserve existing EXIF timestamps
+                    success = self.preserve_exif_timestamp(file_path, file_path)
+                    if success:
+                        self.stats['exif_preserved'] += 1
+
+                elif strategy == 'album_date_inference':
+                    # Infer date from album directory name
+                    success = self.apply_album_date_inference(file_path, file_path)
+                    if success:
+                        self.stats['album_date_inferred'] += 1
+
+                if success:
+                    batch_success += 1
+                    batch_processed.append(file_path)
+                    # Check if we actually got date/GPS data for stats
+                    self._update_metadata_stats(file_path)
+                    self.logger.debug(f"Processed {file_path.name} using {strategy} strategy")
+                else:
+                    batch_unmapped.append(file_path)
+                    self.logger.debug(f"Failed to process {file_path.name} (strategy: {strategy})")
+
+            except Exception as e:
+                self.logger.warning(f"Failed to process {file_path}: {e}")
+                batch_unmapped.append(file_path)
+
+        # Log strategy usage for this batch
+        strategies_used = {}
+        for file_path in batch_processed:
+            _, strategy = self.find_json_metadata_enhanced(file_path)
+            strategies_used[strategy] = strategies_used.get(strategy, 0) + 1
+
+        if strategies_used:
+            strategy_summary = ", ".join([f"{strategy}: {count}" for strategy, count in strategies_used.items()])
+            self.logger.info(f"Batch {batch_num} strategy usage - {strategy_summary}")
+
+        return batch_success, batch_unmapped, batch_processed
+
+    def _apply_json_metadata(self, media_file: Path, json_file: Path) -> bool:
+        """Apply JSON metadata to a media file using ExifTool."""
+        try:
+            cmd = [
+                'exiftool',
+                '-P', '-overwrite_original',
+                '-d', '%s',
+
+                # GPS metadata mapping (with proper coordinate handling)
+                '-GPSLatitude<GeoDataLatitude',
+                '-GPSLatitudeRef<GeoDataLatitude',
+                '-GPSLongitude<GeoDataLongitude',
+                '-GPSLongitudeRef<GeoDataLongitude',
+                '-GPSAltitude<GeoDataAltitude',
+
+                # Date metadata mapping (convert Unix timestamp)
+                '-DateTimeOriginal<PhotoTakenTimeTimestamp',
+                '-CreateDate<PhotoTakenTimeTimestamp',
+
+                # Description and title metadata mapping
+                '-ImageDescription<Description',
+                '-Caption-Abstract<Description',
+                '-Description<Description',
+
+                # Keywords and tags metadata mapping
+                '-Keywords<Tags',
+                '-Subject<Tags',
+                '-Title<Title',
+
+                # Source JSON file
+                '-tagsfromfile', str(json_file),
+                str(media_file)
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Failed to apply JSON metadata from {json_file} to {media_file}: {e}")
+            return False
+
+    def _update_metadata_stats(self, file_path: Path):
+        """Update statistics based on metadata actually applied to file."""
+        try:
+            cmd = ['exiftool', '-json', '-DateTimeOriginal', '-GPSLatitude', '-Description', str(file_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)[0]
+
+            if metadata.get('DateTimeOriginal'):
+                self.stats['date_restored'] += 1
+            if metadata.get('GPSLatitude'):
+                self.stats['gps_restored'] += 1
+
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            pass
+
     def _process_batch_with_verification(self, batch: List[Path], batch_num: int) -> Tuple[int, List[Path], List[Path]]:
         """Process a batch of files and verify metadata was actually applied."""
         batch_success = 0
@@ -501,7 +946,7 @@ class GoogleTakeoutProcessor:
             cmd = [
                 'exiftool',
                 '-api', 'largefilesupport=1',
-                '-overwrite_original',
+                '-P', '-overwrite_original',
                 '-d', '%s',
                 '-ext', 'jpg', '-ext', 'jpeg', '-ext', 'png', '-ext', 'heic',
                 '-ext', 'mp4', '-ext', 'mov', '-ext', 'm4v',
@@ -586,7 +1031,7 @@ class GoogleTakeoutProcessor:
                 cmd = [
                     'exiftool',
                     '-api', 'largefilesupport=1',
-                    '-overwrite_original',
+                    '-P', '-overwrite_original',
                     '-d', '%s',
                     f'-tagsfromfile={json_file}',
 
@@ -775,12 +1220,45 @@ class GoogleTakeoutProcessor:
 
         self.logger.info(f"✅ Successfully processed files copied to: {self.output_dir}")
 
+    def _cleanup_temp_directory(self):
+        """Remove the temporary directory and its contents after successful processing."""
+        if self.temp_dir.exists():
+            try:
+                self.logger.info(f"Cleaning up temporary directory: {self.temp_dir}")
+                shutil.rmtree(self.temp_dir)
+                self.logger.info("✅ Temporary directory cleaned up successfully")
+            except Exception as e:
+                self.logger.warning(f"Failed to remove temporary directory {self.temp_dir}: {e}")
+                # Don't raise the exception - cleanup failure shouldn't stop the process
+
     def generate_report(self) -> Dict:
         """Generate final processing report."""
+        # Enhanced metadata strategy breakdown
+        metadata_strategies = {
+            'direct_json_matches': self.stats['json_matched'],
+            'cross_album_matches': self.stats['cross_album_matched'],
+            'album_metadata_applied': self.stats['album_metadata_applied'],
+            'filename_metadata_extracted': self.stats['filename_metadata_extracted'],
+            'exif_preserved': self.stats['exif_preserved'],
+            'album_date_inferred': self.stats['album_date_inferred']
+        }
+
+        total_enhanced = sum(metadata_strategies.values())
+
         report = {
             'processing_stats': self.stats,
+            'metadata_strategies': metadata_strategies,
             'summary': f"Processed {self.stats['processed_files']} of {self.stats['total_files']} files",
-            'success_rate': f"{(self.stats['processed_files'] / max(1, self.stats['total_files'])) * 100:.1f}%"
+            'success_rate': f"{(self.stats['processed_files'] / max(1, self.stats['total_files'])) * 100:.1f}%",
+            'enhanced_metadata_total': total_enhanced,
+            'strategy_breakdown': {
+                'direct_json': f"{(self.stats['json_matched'] / max(1, total_enhanced)) * 100:.1f}%",
+                'cross_album': f"{(self.stats['cross_album_matched'] / max(1, total_enhanced)) * 100:.1f}%",
+                'album_level': f"{(self.stats['album_metadata_applied'] / max(1, total_enhanced)) * 100:.1f}%",
+                'filename': f"{(self.stats['filename_metadata_extracted'] / max(1, total_enhanced)) * 100:.1f}%",
+                'exif_preserved': f"{(self.stats['exif_preserved'] / max(1, total_enhanced)) * 100:.1f}%",
+                'album_date_inferred': f"{(self.stats['album_date_inferred'] / max(1, total_enhanced)) * 100:.1f}%"
+            }
         }
 
         # Save detailed report
@@ -814,6 +1292,10 @@ class GoogleTakeoutProcessor:
         """Main processing pipeline."""
         self.update_status("Starting Google Takeout processing...")
 
+        # Track whether we extracted from ZIP files (needs cleanup)
+        extracted_from_zips = False
+        cleanup_done = False
+
         try:
             # Phase 1: Determine input type and prepare working directory
             input_type, working_dir = self.determine_input_type()
@@ -822,10 +1304,12 @@ class GoogleTakeoutProcessor:
                 # Extract ZIP files
                 zip_files = self.input_source if isinstance(self.input_source, list) else [self.input_source]
                 working_dir = self.extract_takeout_zips([Path(f) for f in zip_files])
+                extracted_from_zips = True
             elif input_type == "zip_directory":
                 # Find and extract all ZIP files in directory
                 zip_files = list(working_dir.glob("takeout-*.zip"))
                 working_dir = self.extract_takeout_zips(zip_files)
+                extracted_from_zips = True
             # else: input_type == "extracted_directory", use working_dir as-is
 
             # Phase 2: Discover media files
@@ -834,6 +1318,10 @@ class GoogleTakeoutProcessor:
 
             if not google_photos_dirs:
                 raise ValueError("No 'Google Photos' directories found")
+
+            # Phase 2.5: Index metadata for enhanced processing
+            self.update_status("Indexing metadata for enhanced processing...", 0.22)
+            self.index_metadata_for_enhanced_processing(google_photos_dirs)
 
             all_media_files = []
             for photos_dir in google_photos_dirs:
@@ -856,6 +1344,11 @@ class GoogleTakeoutProcessor:
             self.update_status("Generating report...", 0.9)
             report = self.generate_report()
 
+            # Phase 7: Cleanup temp directory if we extracted from ZIPs
+            if extracted_from_zips and not self.dry_run:
+                self._cleanup_temp_directory()
+                cleanup_done = True
+
             self.update_status(f"Processing complete: {report['summary']}", 1.0)
             return True
 
@@ -864,6 +1357,14 @@ class GoogleTakeoutProcessor:
             self.logger.error(error_msg)
             self.update_status(error_msg)
             return False
+
+        finally:
+            # Ensure cleanup happens even on failure (only if we extracted from ZIPs and haven't cleaned up yet)
+            if extracted_from_zips and not self.dry_run and not cleanup_done:
+                try:
+                    self._cleanup_temp_directory()
+                except Exception as cleanup_error:
+                    self.logger.warning(f"Failed to cleanup temp directory: {cleanup_error}")
 
 
 class TakeoutProcessorGUI:
