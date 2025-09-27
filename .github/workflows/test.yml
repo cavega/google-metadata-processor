@@ -27,16 +27,12 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        # Install any additional dependencies if needed
+        pip install pytest
 
     - name: Verify ExifTool installation
       run: |
         exiftool -ver
         which exiftool
-
-    - name: Run unit tests
-      run: |
-        python3 test_takeout_processor.py
 
     - name: Run comprehensive test suite
       run: |
