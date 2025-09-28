@@ -36,4 +36,4 @@ jobs:
 
     - name: Run comprehensive test suite
       run: |
-        python3 run_tests.py
+        python -m pytest test_takeout_processor.py -v
